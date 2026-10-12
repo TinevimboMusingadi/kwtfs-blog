@@ -15,6 +15,7 @@ tools/build_data.py   saved experiment outputs  ->  data/*.json (figure data) + 
 tools/render.py       src/post.html + numbers.json + tools/refs.json  ->  index.html + medium.md
 tools/snapshot.py     headless Chrome  ->  img/fig-*.png (static figures for medium.md) + img/og.png
 tests/reward_parity.py  the reward explorer's JS against the Python training reward
+tools/linkcheck.py    every external link returns 200
 ```
 
 `src/post.html` uses two placeholders, and rendering fails if either does not resolve:
@@ -34,7 +35,8 @@ committed `data/` is what the page uses. `research_notes/bibliography.md` holds 
 ## Data notes
 
 Example traces quote question text only from sources whose licences allow it (GSM8K, AQuA, ARC, CommonsenseQA and
-procedurally generated tasks). Questions from the BEV decision mix and OpenBookQA appear only as IDs and statistics.
+procedurally generated tasks). Questions from the BEV decision mix and OpenBookQA appear only as IDs and statistics. Quoted questions keep
+their source licences (ARC is CC BY-SA 4.0) and are not covered by the CC BY 4.0 licence below.
 
 ## Licence
 
