@@ -1,0 +1,324 @@
+<h2 id="intro"><span class="sec">§ 1</span>Introduction</h2>
+
+<p>Ask a person whether 5,975 is bigger than 5,974 and they answer instantly. Ask them how many parcels are left after two depots each receive 6,063 and dispatch 3, and they slow down and work it out. Kahneman called these System 1 and System 2 {{cite:kahneman2011}}. What matters for us is less the two systems than the switch between them. Thinking slowly costs effort, so people only do it when the fast answer is not good enough.</p>
+
+<p>Language models have mostly lost that switch. Over the last two years the frontier slid into <em>always</em> reasoning. Reinforcement learning with verifiable rewards taught models that writing a chain of thought before answering pays off {{cite:openai2024reason,deepseek2025r1}}, and test-time compute became something to scale {{cite:snell2024}}. That works, and it also means a model now writes paragraphs to tell you that 2 + 3 = 5 {{cite:chen2024overthinking}}. The industry's answers so far are a switch the <em>user</em> flips {{cite:qwen3}}, or a separate router that sends each request to a fast model or a thinking model {{cite:openai2025gpt5card}}.</p>
+
+<p>This post is about a narrower question, which I spent the last weeks working on with a small model and a few dollars of spot TPU time:</p>
+
+<p class="callout">Can one small model learn, <em>question by question</em>, whether to decide in a single forward pass, answer in a few words, or reason first, all inside the same network?</p>
+
+<p>The model is Qwen3-4B with a LoRA adapter {{cite:qwen3_4b,hu2021lora}}, trained with supervised fine-tuning and then GRPO {{cite:shao2024deepseekmath}} using Google's Tunix library {{cite:tunix}} on spot TPU v5e chips. It answers every question by first writing a mode tag:</p>
+
+<ul>
+<li><span class="mode jev">&lt;mode:jev&gt;</span> means <em>decide now</em>. The runtime does not generate any text. It runs one forward pass and reads the answer off the logits of the option letters.</li>
+<li><span class="mode direct">&lt;mode:direct&gt;</span> means <em>answer in a few words</em>.</li>
+<li><span class="mode cot">&lt;mode:cot&gt;</span> means <em>reason first</em>. The model writes a short chain of thought and then either states an answer or hands off to a one-step decision.</li>
+</ul>
+
+<figure class="wide">
+<div class="fig" id="fig-hero"></div>
+<figcaption><b>Figure 1. One network, three ways to answer.</b> Real questions from the sealed test set and the trained model's own outputs. The first token the model writes picks the mode, and the runtime then executes that mode natively. In the one-step mode nothing is generated: a single forward pass scores the option letters. Use the buttons to replay each mode.</figcaption>
+</figure>
+
+<p>Here is what I found, in the order the post explains it:</p>
+
+<ol class="findings">
+<li><b>One network can host the fast decision and the slow reasoning, and learn when to use which.</b> A one-step decision is just a constrained next-token step in the model's own vocabulary, so ordinary token-level RL trains reasoning, decisions and the choice between them together (<a href="#idea">§3</a>).</li>
+<li><b>The routing labels have to be measured on the model, not assigned.</b> My first attempt labelled each question with the mode it "should" use, decided when the data was generated, and learned routing ended up {{n:v1_gap|pts1}} points <em>below</em> always reasoning. In v2 I ran Qwen3-4B on every question in every mode and took the mode with the best accuracy minus token cost (<a href="#v1">§4</a>, <a href="#measure">§5</a>).</li>
+<li><b>The model largely knows in advance whether it can answer without thinking.</b> A linear probe on its hidden state, read before any token is generated, predicts each mode's success with AUROC {{n:probe.jev.auroc|f2}}–{{n:probe.direct.auroc|f2}}. As a router on its own, though, the probe is mediocre (<a href="#probe">§7</a>).</li>
+<li><b>Learned routing matches always-reasoning accuracy with about {{n:test_token_saving_vs_cot|pct0}} fewer tokens.</b> Averaged over five RL seeds on {{n:test_n|int}} sealed test questions: {{n:test_e3b_mean|pct1}} accuracy at {{n:test_e3b_mean_tokens|f1}} tokens, against {{n:test_e3b_mean_cot_acc|pct1}} at {{n:test_e3b_mean_cot_tokens|f1}} tokens when the same weights are forced to reason every time (<a href="#learned">§10</a>).</li>
+<li><b>A reward for the gap between the chosen mode and the measured best mode makes RL stable.</b> With it, five seeds land at {{n:test_e3b_mean|pct1}} ± {{n:test_e3b_sd|pts1}} points. With an outcome-only reward, the same five seeds spread from {{n:test_e2_min|pct1}} to {{n:test_e2_max|pct1}}: some runs slide into under-thinking (<a href="#reward">§9</a>, <a href="#learned">§10</a>).</li>
+<li><b>Whether it is "worth it" depends on what a token costs, and it never loses.</b> Pricing tokens the way training did, learned routing beats always reasoning by a small but significant margin. At higher prices the gap widens steadily (<a href="#worth">§11</a>).</li>
+</ol>
+
+<p>Much of the interesting material is in what did <em>not</em> work: an RL run that collapsed, labels that lied, a probe that predicted well and routed badly, and two rewards that did nothing. I have kept those in the story where they happened, because they explain why the final recipe looks the way it does. Every number on this page is generated from the experiment outputs. None is typed by hand.<sup class="fn" data-note="The site is built by <code>tools/build_data.py</code>, which re-scores every saved model completion with the same code the experiments used. <code>tools/render.py</code> then fills each number into the text and refuses to render if any placeholder is missing."></sup></p>
+
+<h2 id="background"><span class="sec">§ 2</span>Background: how models spend thinking</h2>
+
+<h3><span class="sec">2.1</span>Thinking is just more tokens</h3>
+
+<p>An autoregressive language model does a fixed amount of computation per token: one forward pass through every layer. A model that answers "C" spends one forward pass. A model that writes 200 tokens of reasoning first spends 201. So in a decoder, <em>thinking longer</em> just means <em>emitting more tokens before the answer</em>. Chain-of-thought prompting {{cite:wei2022cot}} showed those extra tokens are not wasted: they let the model carry intermediate results forward, and accuracy on multi-step problems jumps. It also showed the gains are uneven. A large meta-analysis later found that chain of thought helps mostly on maths and symbolic problems and barely moves commonsense or knowledge questions {{cite:sprague2024cot}}. Hold on to that; it is exactly the pattern our model ends up learning by itself.</p>
+
+<h3><span class="sec">2.2</span>How RL taught models to always think</h3>
+
+<p>Reasoning models are built by reinforcement learning with <em>verifiable</em> rewards: sample an answer, check it against the gold value, and push up the probability of whatever led to a correct answer. GRPO {{cite:shao2024deepseekmath}} does this without a value network. For each prompt it samples a group of \(G\) completions, scores them, and uses each completion's reward relative to its group as the advantage:</p>
+
+<div class="math">$$A_i = \frac{r_i - \operatorname{mean}(r_1,\dots,r_G)}{\operatorname{std}(r_1,\dots,r_G)}, \qquad \nabla J \approx \frac{1}{G}\sum_i A_i \,\nabla \log \pi(o_i \mid q).$$</div>
+
+<p>Here is the first-principles reason this produces ever-longer reasoning. Imagine a question the model can answer three ways: guess immediately (right 35% of the time), reason briefly (80%), or reason at length (90%). Long reasoning has the highest expected reward, so its completions get positive advantage more often, and every token in them, including every "wait, let me check", gets pushed up. Run the update a few hundred times and the probability mass flows toward long reasoning, regardless of whether the question needed it. The figure below runs exactly this update on a three-way policy.</p>
+
+<figure>
+<div class="fig" id="fig-rlvr"></div>
+<figcaption><b>Figure 2. RL with a verifiable reward, from first principles.</b> A softmax policy over three ways of answering one kind of question, updated with the exact expected policy gradient. Each logit moves by \(\pi_a (R_a - \mathbb{E}[R])\). With no token price, mass flows to the most accurate option, long reasoning, even though short reasoning is nearly as good. Raise the token price (charged only on correct answers, as in our real reward) and press the button again to see the optimum move to the cheaper option.</figcaption>
+</figure>
+
+<p>Two caveats from the literature shape everything later. First, RL mostly <em>re-weights</em> behaviour the base model can already produce, rather than inventing new abilities {{cite:yue2025rlvr}}: if a mode is never sampled, RL cannot discover it. Second, plain GRPO has quirks when completions differ wildly in length. Groups where every sample gets the same reward carry no gradient {{cite:yu2025dapo}}, and length normalisation biases the update {{cite:liu2025drgrpo}}. Both matter when one of your modes is one token long and another is two hundred.</p>
+
+<h3><span class="sec">2.3</span>Four ways people have tried to get the fast path back</h3>
+
+<p><b>A switch the user flips.</b> Qwen3 merged a thinking and a non-thinking mode into one model: you pass <code>enable_thinking</code> or write <code>/think</code> and <code>/no_think</code> {{cite:qwen3}}. Our base model has both modes built in. But the <em>user</em> decides, not the model.</p>
+
+<p><b>A switch the model learns.</b> A fast-growing line of work trains the model to emit a control token first: Thinkless picks <code>&lt;short&gt;</code> or <code>&lt;think&gt;</code> {{cite:fang2025thinkless}}. AdaptThink {{cite:zhang2025adaptthink}}, AutoThink {{cite:tu2025autothink}}, hybrid reasoning models {{cite:jiang2025lhrm}}, AdaCoT {{cite:lou2025adacot}} and others {{cite:xu2026stable}} learn when to skip the think block. ARM chooses among four formats, including a direct answer {{cite:wu2025arm}}. The closest prior work to mine, which I found while writing this post, picks one of three modes (no-think, short, long) as the first token inside GRPO, with no external router {{cite:kassenaar2026when}}. Two lessons recur across these papers. Vanilla GRPO tends to <em>collapse</em> onto one mode, because one control token is easily outvoted by hundreds of response tokens. And in every one of them, the fast path still <em>generates</em> an answer.</p>
+
+<p><b>Thinking without words.</b> Latent reasoning moves the chain of thought into hidden states, feeding the last hidden vector back in as the next input instead of a token {{cite:hao2024coconut,zhang2025soft,zhu2025latentsurvey}}, or adding silent "pause" tokens {{cite:goyal2023pause}}. That saves text, not forward passes: the model still iterates.</p>
+
+<p><b>Two models and a router.</b> Cascades and routers send each query to a cheap or an expensive model {{cite:chen2023frugalgpt,ding2024hybrid,ong2024routellm}}. GPT-5 ships this way, a fast model and a thinking model behind a real-time router, and its system card says the plan is to merge them into one model {{cite:openai2025gpt5card}}.</p>
+
+<figure class="wide">
+<div class="fig" id="fig-landscape"></div>
+<figcaption><b>Figure 3. Where the fast/slow decision happens.</b> Every approach above keeps its fast path generating text, splits the work across separate models, or never decides at all. Decision heads on a pretrained model (bottom-but-one) do the opposite: they only ever decide in one step. This work puts that one-step decision and the reasoning in the same network, and lets the network choose between them.</figcaption>
+</figure>
+
+<h3><span class="sec">2.4</span>The overlooked ingredient: one-step decisions on a language model</h3>
+
+<p>There is an older and almost boring idea that turns out to be the key. A pretrained language model is already a very good one-step classifier. GPT-1 and BERT showed that a tiny head on top of pretrained representations beats task-specific models {{cite:radford2018gpt,devlin2018bert}}. The standard MMLU evaluation scores a model by reading the probability it assigns to the letters A–D after the question, with no generation at all {{cite:hendrycks2020mmlu}}. Showing all options and scoring one answer symbol works well once a model is good at binding options to letters {{cite:robinson2022mcp}}, and it sidesteps the problem of scoring long answer strings {{cite:holtzman2021sfc}}.</p>
+
+<p>The idea for the fast mode came from <code>bev-train</code> {{cite:biswas_bevtrain}}, which trains "JEV" decision networks on a Qwen3 backbone: typed choices (pick an option, yes/no, or a score on a scale) answered in one pass, with no reasoning. Its training set, the BEV decision mix {{cite:biswas_bevdata}}, is a large collection of exactly this kind of decision.</p>
+
+<div class="diary">
+<div><span class="tag">Borrowed</span><span>JEV-style decision models are trained on top of an already-trained language model. They reuse the representations the model built for language and read a decision off them in one step.</span></div>
+<div><span class="tag">The insight</span><span>If the decision lives in the same representation space the model reasons in, the model does not need a second network to decide. It needs to learn <em>when</em> to stop and decide. Fast and slow become two ways of using one set of weights, not two systems.</span></div>
+<div><span class="tag">Still open</span><span>Whether this holds for decisions that are not multiple choice, such as free-form actions or tool calls, is not tested here.</span></div>
+</div>
+
+<h2 id="idea"><span class="sec">§ 3</span>The idea: one network, native switching</h2>
+
+<p>Put concretely, every answer starts with a short tag. The model sees a system prompt that names the three modes and a control line, <code>Mode: auto</code>, or a forced mode such as <code>Mode: cot</code>. It writes <code>&lt;genre:arith&gt;&lt;mode:cot&gt;</code>, or another genre and mode, and the runtime then does one of three things:</p>
+
+<table>
+<tr><th>tag</th><th>what the runtime does</th><th>typical cost</th></tr>
+<tr><td><span class="mode jev">&lt;mode:jev&gt;</span></td><td>No generation. One forward pass; take the logits of the shown option letters only; softmax; argmax.</td><td class="n">1 token</td></tr>
+<tr><td><span class="mode direct">&lt;mode:direct&gt;</span></td><td>Generate a short <code>&lt;answer&gt;…&lt;/answer&gt;</code> (capped at 48 tokens).</td><td class="n">~10–20 tokens</td></tr>
+<tr><td><span class="mode cot">&lt;mode:cot&gt;</span></td><td>Generate reasoning (capped at 256 tokens). If it writes <code>&lt;mode:jev&gt;</code> partway, stop generating and finish with a one-step decision.</td><td class="n">~50–150 tokens</td></tr>
+</table>
+
+<p>The trick that makes this trainable is that <b>the one-step decision is a single next-token step in the model's own vocabulary</b>. Each option letter A–F is a single token. Choosing an option is the same operation as predicting one token with the rest of the vocabulary masked out. So the whole policy — which mode, what reasoning, which letter — is just a distribution over token sequences, and stock token-level GRPO can train all of it at once. Only the <em>runtime</em> treats the modes differently.</p>
+
+<div class="diary">
+<div><span class="tag">Borrowed</span><span>My first version did what <code>bev-train</code> does: a separate order-invariant scoring head on top of Qwen, with its own decision tokens.</span></div>
+<div><span class="tag">Broke</span><span>Supervised training worked. Reinforcement learning never did. Mixing token log-probabilities with a categorical head's actions needed a custom RL learner, and on TPU it hit NaNs, compiler stalls and memory failures. Most of the budget went into making that learner stable.</span></div>
+<div><span class="tag">Reframed</span><span>Drop the head. Make the decision an option-letter token in the language model's own output layer. The decision is then just another token, and an off-the-shelf GRPO implementation trains it with no custom code.</span></div>
+<div><span class="tag">Still open</span><span>A dedicated head is order-invariant by construction; letter logits are not, and models are known to have option-position biases. I did not measure position bias here.</span></div>
+</div>
+
+<p>One more piece of design matters later. The model can be <em>told</em> which mode to use. Half of the supervised training data has a forced <code>Mode: X</code> line, so the tags become real switches: the same weights can be run as "always decide", "always answer briefly" or "always reason". That gives every experiment its own controls. When I compare learned routing with "always reason", it is the same model, same weights, only the switch differs.</p>
+
+<h2 id="v1"><span class="sec">§ 4</span>A failure worth learning from</h2>
+
+<p>The first full run of this idea used Qwen3-1.7B, and the results were sobering. Starting RL straight from the base model collapsed: the base model almost never wrote a valid mode tag, the cheapest valid format was the only thing that ever scored, and GRPO pushed the whole policy onto it. Accuracy on the sealed test fell from {{n:v1.base.acc|pct1}} to {{n:v1.rl_from_base.acc|pct1}}, a textbook case of RL only being able to sharpen what is already there {{cite:yue2025rlvr}}.</p>
+
+<p>A short supervised warm-start fixed the collapse and lifted learned routing to {{n:v1.sft.acc|pct1}}. But the same model, simply <em>forced</em> to reason every time, scored {{n:v1.sft.cot_acc|pct1}}. RL at a higher learning rate made the model cheaper ({{n:v1.rl_lr3e5.tokens|f1}} tokens instead of {{n:v1.sft.tokens|f1}}) but no better ({{n:v1.rl_lr3e5.acc|pct1}}). Learned routing was <em>worse</em> than not routing at all.</p>
+
+<p>The reason was in the data, not the algorithm. Each training question carried a label saying which mode it "needed", and those labels were assigned when the dataset was generated. The same family of arithmetic problem appeared labelled "fast", "direct", "reason" and "reason then decide". A question like <em>split 10,014 and 92 items equally</em> was labelled "direct", but a 1.7B model cannot do that without working it out: on questions labelled direct, it was right only {{n:v1.run3_direct_behavior_acc|pct0}} of the time. The model was being taught to route on wording, and RL had nothing clean to correct it with.</p>
+
+<p class="callout">The lesson that shaped everything in v2: <b>which mode a question needs is not a property of the question. It is a property of the question <em>and the model</em></b>, and it has to be measured.</p>
+
+<h2 id="measure"><span class="sec">§ 5</span>Measuring what the model can do</h2>
+
+<p>For v2 I built a pool of {{n:data.built|int}} single-turn questions across {{n:data.genres|raw}} kinds of question, chosen so that the right mode should differ <em>within</em> each kind:</p>
+<ul>
+<li><b>decisions</b> from the BEV decision mix {{cite:biswas_bevdata}}: sentiment, support routing, code, spatial puzzles, rated qualities;</li>
+<li><b>knowledge</b> multiple choice from ARC, OpenBookQA and CommonsenseQA {{cite:clark2018arc,mihaylov2018obqa,talmor2019csqa}};</li>
+<li><b>word problems</b> from GSM8K and AQuA {{cite:cobbe2021gsm8k,ling2017aqua}};</li>
+<li>generated <b>comparisons</b>, <b>arithmetic</b> and <b>scoring rules</b>, each with a difficulty knob (digits, steps, nesting depth).</li>
+</ul>
+
+<p>Then, instead of deciding which mode each question needs, I asked the model. Base Qwen3-4B answered every question in every mode it could use: four samples each for "direct" and "reason", and an exact probability for the one-step decision. For each question \(x\) and mode \(m\) this gives an accuracy \(p_m(x)\) and a mean cost \(t_m(x)\) in tokens. The label is the mode with the best <em>utility</em>:</p>
+
+<div class="math">$$U_m(x) = p_m(x) - \lambda\, t_m(x), \qquad \text{suggested}(x) = \arg\max_m U_m(x).$$</div>
+
+<p>At \(\lambda = 0.0005\), a hundred tokens of reasoning are worth five points of accuracy. That price is a value judgement, not a fact, so the labels store the full \(p\) and \(t\) vectors and can be re-priced for free. The slider below re-prices them live.</p>
+
+<figure class="wide">
+<div class="fig" id="fig-labels"></div>
+<figcaption><b>Figure 4. The measured best mode, by kind of question.</b> Each bar is up to 500 questions, with the base model's measured per-mode accuracy and token cost. Drag the token price: at zero, reasoning wins almost everywhere it helps at all; as tokens get expensive, the one-step decision takes over. Comparisons and knowledge questions are one-step territory at any sensible price, which is what "To CoT or not to CoT" predicts {{cite:sprague2024cot}}. Arithmetic, word problems and scoring rules genuinely split.</figcaption>
+</figure>
+
+<p>The labels came out <em>capability-relative</em> in a way no hand-labelling would have produced. Number comparisons, which the 1.7B model needed to reason about, are a one-step decision for 4B on {{n:label_share.compare.jev|pct0}} of questions at every digit count. Scoring rules flip from "just pick" at depth one to "reason" at depth two and three. Word problems need reasoning more often as they get longer.</p>
+
+<h3><span class="sec">5.1</span>Is there anything to learn? The winner's curse</h3>
+
+<p>Before training anything, I wanted to know whether per-question routing could beat the obvious simple rules. The naive check is misleading. Picking the best of four noisy estimates for each question and then scoring that pick on the <em>same</em> samples overstates what any router can achieve, the same winner's curse that inflates any "best of N" estimate. The honest version is cross-fitted: choose the mode on two of the four samples and score it on the other two.</p>
+
+<figure>
+<div class="fig" id="fig-headroom"></div>
+<figcaption><b>Figure 5. How much a perfect router could gain.</b> Utility on all {{n:labels.n|int}} questions. "Best mode per question type" is the strongest rule that ignores the question itself: always use the mode with the best average utility for that kind of question. A perfect per-question router (cross-fitted, so not flattered by noise) gains {{n:labels.headroom|p3}} utility over it. That is real headroom, but not a huge prize.</figcaption>
+</figure>
+
+<p>I set three checks the labels had to pass before I would train on them. <b>Stability:</b> labels computed from two halves of the samples agree on {{n:labels.stability|pct0}} of the questions where there is a clear winner. <b>Headroom:</b> above 0.05 utility, as just shown. <b>Within-type variation:</b> the label should not be predictable from the kind of question alone. That third check <em>failed</em> for comparisons, knowledge and decisions, where one-step decisions win on {{n:label_share.decision.jev|pct0}}–{{n:label_share.compare.jev|pct0}} of questions. I kept them anyway, because they are the questions where the right answer is "don't think", but it means much of the routing problem is easy and the interesting part is concentrated in maths and rules.</p>
+
+<p class="limit">The labels describe the <em>base</em> model. After supervised training the model reasons noticeably better, so by the time RL runs, the labels are partly out of date. Re-measuring them on the trained model is the obvious next iteration.</p>
+
+<h2 id="audit"><span class="sec">§ 6</span>A small data-science detour: checking the answer key</h2>
+
+<p>Routing labels built on wrong gold answers would teach the model to avoid modes that were actually right. So before profiling, I checked the answer key. Schema checks caught the easy problems: a few percent of AQuA questions had duplicate options or the right answer listed twice. Removing near-duplicates <em>before</em> splitting the data guaranteed no test question leaked into training. My own generators had their own bugs: "yes" was always option A, and one scoring rule put most gold answers at its clipped extremes.</p>
+
+<p>For the subtle errors I used the model as a reviewer. Qwen3-4B with its full thinking mode re-answered every validation and test question plus a sample of training questions, and I hand-reviewed every case where it confidently disagreed with the answer key: {{n:data.flagged|int}} flags. Most were the model being wrong. Some were not. One GSM8K problem has an official answer of 115 where the arithmetic gives 95; an AQuA problem has no correct option at all. The estimated error rates are small, {{n:audit_wrong_range.0|pct1}} to {{n:audit_wrong_range.1|pct1}} in the maths and science sets. But about one CommonsenseQA question in ten ({{n:audit_rates.commonsenseqa.ambiguous|pct1}} of those audited) has two defensible answers, which is worth knowing before reading anything into accuracy on that dataset. I fixed {{n:audit.fixed|raw}} test answers and dropped {{n:audit.dropped|raw}} questions, leaving {{n:data.final|int}}.</p>
+
+<p class="limit">"Confidently disagrees" only finds errors the model can spot. Questions where the model and the key are wrong together are invisible to this audit, so these error rates are lower bounds.</p>
+
+<h2 id="probe"><span class="sec">§ 7</span>Does the model know when it needs to think?</h2>
+
+<p>If the right mode is a property of the model, perhaps the model already represents it. Language models are known to be reasonably calibrated about what they know {{cite:kadavath2022know}}, and their hidden states carry signals about whether an answer will be true {{cite:azaria2023lying,kossen2024sep,orgad2024know}}, even mid-reasoning {{cite:zhang2025probe}}. So I took the base model's final hidden state at the very end of the question, <em>before it generates anything</em>, and trained one linear probe per mode to predict that mode's measured accuracy.</p>
+
+<figure class="wide">
+<div class="fig" id="fig-probe"></div>
+<figcaption><b>Figure 6. A probe on the hidden state predicts each mode's success before any token is generated.</b> Calibration on the sealed test questions: predicted probability of being correct (x) against measured accuracy (y), with dot size showing the number of questions. Points near the diagonal mean the probe's confidence can be taken at face value. The probe never saw these questions.</figcaption>
+</figure>
+
+<p>It works surprisingly well: AUROC {{n:probe.jev.auroc|f2}} for the one-step decision, {{n:probe.direct.auroc|f2}} for direct answers and {{n:probe.cot.auroc|f2}} for reasoning, with expected calibration errors of a few points. In a meaningful sense, the model largely knows in advance whether it can answer without thinking.</p>
+
+<div class="diary">
+<div><span class="tag">Borrowed</span><span>The natural next step is to use the probe as the router: predict each mode's utility and pick the best.</span></div>
+<div><span class="tag">Broke</span><span>As a router it only tied the simple per-question-type rule on validation ({{n:probe_router_val.probe|p3}} against {{n:probe_router_val.lookup|p3}}, with a perfect router at {{n:probe_router_val.oracle|p3}}). The probe is good at ranking questions, but routing is decided by <em>small differences</em> between modes. When reasoning and a one-step pick are both around 90%, a few points of error flip the choice.</span></div>
+<div><span class="tag">Reframed</span><span>Do not let the probe decide. Use it to <em>shape</em> training, as a soft signal of how much worse one mode is than another, which RL can then override with real outcomes (§9).</span></div>
+</div>
+
+<h2 id="sft"><span class="sec">§ 8</span>Teaching the tags as switches</h2>
+
+<p>RL can only reinforce behaviour it samples (§4), so the model first has to be able to produce every mode on command. The supervised mix has two halves:</p>
+<ul>
+<li><b>Obedience.</b> The prompt says <code>Mode: cot</code>, <code>jev</code> or <code>direct</code>, and the target is a correct answer in that mode. This is what makes the tags real switches.</li>
+<li><b>Routing.</b> The prompt says <code>Mode: auto</code>, and the target uses the mode measured best for that question.</li>
+</ul>
+
+<figure>
+<div class="fig" id="fig-sft"></div>
+<figcaption><b>Figure 7. The supervised training mix</b> ({{n:sft_examples|int}} examples). The routing half reflects the measured labels, mostly one-step decisions with reasoning where it pays. The obedience half covers every mode on every kind of question.</figcaption>
+</figure>
+
+<p>The reasoning examples are the model's own. For each question I sampled four short chains of thought and kept the shortest one that was correct. Correctness turned out not to be enough. Of {{n:traces.samples|int}} samples, {{n:traces.false_among_checkable|pct1}} of those containing checkable arithmetic contained a <em>false</em> equation, and {{n:traces.false_but_correct|pct0}} of those still reached the right answer. The written reasoning is not always the computation that produced the answer, a known property of chain of thought {{cite:turpin2023unfaithful,lanham2023faithful}}. I filtered those traces out, so the model never imitates a wrong step that happened to land on the right answer.</p>
+
+<p>Supervised training worked as a switch: forced-mode obedience is {{n:obedience_min|pct0}} in every one of the {{n:obedience_evals|raw}} forced-mode evaluations I ran, before and after RL. As a router it under-thinks. Left to choose, the model takes the one-step decision on {{n:sft_auto_jev_share|pct0}} of test questions and scores {{n:sft_auto_acc|pct1}}, {{n:sft_gap|pts1}} points below the same weights forced to reason ({{n:sft_cot_acc|pct1}}). Imitating labels from the base model taught it the base model's caution about thinking, while the fine-tuned model's reasoning had become noticeably better. Closing that gap is the job of RL.</p>
+
+<h2 id="reward"><span class="sec">§ 9</span>Rewarding the right decision</h2>
+
+<p>The obvious RL reward is the one every reasoning model uses: 1 for a correct answer, minus a little for every token. Here is why that is not enough for routing, from first principles.</p>
+
+<p>When a model meets a question, the context <em>shapes</em> its distribution over modes before it writes anything. Outcome-only RL nudges that distribution using one signal: whether the mode it happened to sample this time was right. For a one-step decision on an easy question, that is usually yes. So early in training, cheap decisions collect a lot of reward, and the policy drifts toward deciding without thinking — <em>including on the questions where thinking was the better bet</em>, because a single lucky correct guess looks exactly like a good decision. How far a run drifts depends on the luck of its samples. Nothing in the reward says that, for <em>this</em> question, a different mode is measurably better.</p>
+
+<p>So I added the missing signal. The reward has the usual verifiable terms, plus one more:</p>
+
+<div class="math">$$r_{\text{route}} = -\beta_t \,\bigl(\max_{m} U_m(x) - U_{\hat m}(x)\bigr),$$</div>
+
+<p>where \(\hat m\) is the mode the model chose and \(U_m(x)\) are the per-mode utilities: predicted by the probe from §7, or measured directly. This is the <em>regret</em> of the decision, how much utility the chosen mode leaves on the table compared with the best mode for this question. Three properties make it the right shape:</p>
+<ul>
+<li><b>It is zero when the choice is as good as the best,</b> including near-ties. Unlike a reward for imitating the suggested label, it never punishes a different but equally good mode, so RL is free to find cheaper routes than the labels suggest.</li>
+<li><b>It is graded.</b> Picking a one-step decision on a word problem where it is right 25% of the time costs far more than on a comparison where it is right 99% of the time.</li>
+<li><b>It fades out.</b> \(\beta_t\) starts at 0.5 and decays to zero over the first 60% of training. The regret term steers early exploration; the final policy is decided by real outcomes.</li>
+</ul>
+
+<p>The other terms carry over from standard practice, with two changes that came from v1's failures. The token cost is charged only on <em>correct</em> answers, so a short wrong answer never beats a long right one. Disobeying a forced mode is the worst possible outcome, so obedience cannot decay during RL; 30% of RL prompts force a mode. I also tried two extra terms: a penalty for false equations in the reasoning, and a bonus for naming the right kind of question.</p>
+
+<figure>
+<div class="fig" id="fig-reward"></div>
+<figcaption><b>Figure 8. The reward, term by term.</b> This reproduces the training reward exactly (<code>kwt/rewards_v2.py</code>). Pick a kind of question and the mode the model chose; flip whether the answer was right; drag training progress to watch the regret term fade out. On a word problem, a correct one-step decision still loses most of its advantage early in training, because reasoning was the measurably better bet.</figcaption>
+</figure>
+
+<p class="limit">The utilities behind the regret come from the base model (or a probe trained on it), so the regret term inherits the staleness noted in §5. Fading it out limits the damage, but a regret target that is updated as the policy improves would be better.</p>
+
+<h2 id="learned"><span class="sec">§ 10</span>What RL learned</h2>
+
+<p>Every RL run starts from the same supervised checkpoint and trains for 150 GRPO steps: four questions per step, eight samples each, on a four-chip TPU v5e slice. I trained the two main configurations five times each with different sampling seeds, plus single runs of the ablations. Everything below is on the sealed test split, opened once, and on an out-of-distribution split: a decision domain never seen in training, plus 6-digit arithmetic where training only had up to 5 digits.</p>
+
+<h3><span class="sec">10.1</span>Training dynamics</h3>
+
+<figure class="wide">
+<div class="fig" id="fig-dynamics"></div>
+<figcaption><b>Figure 9. How the policy moves during RL.</b> Each line is one training run; colour is the reward. Both rewards start from the same under-thinking checkpoint and both learn to reason more. The outcome-only runs wander: each settles at a different level of reasoning. Logs for three of the ten seeds were overwritten by an accidental relaunch after training finished and are not shown; their evaluation results are unaffected.</figcaption>
+</figure>
+
+<h3><span class="sec">10.2</span>Accuracy against tokens</h3>
+
+<figure class="wide">
+<div class="fig" id="fig-frontier"></div>
+<figcaption><b>Figure 10. Every model on the accuracy–token plane.</b> Circles are the regret reward, squares outcome-only, one point per seed; diamonds are the same weights forced to always reason. Hover for details. With the regret reward, all five seeds sit together at the top, about a third cheaper than always reasoning. Outcome-only seeds lie along a line: the fewer tokens a run learned to spend, the lower its accuracy.</figcaption>
+</figure>
+
+<p>With the regret reward, learned routing reaches {{n:test_e3b_mean|pct1}} on the test set at {{n:test_e3b_mean_tokens|f1}} tokens per question. The same weights forced to reason every time reach {{n:test_e3b_mean_cot_acc|pct1}} at {{n:test_e3b_mean_cot_tokens|f1}} tokens. That is the same accuracy for {{n:test_token_saving_vs_cot|pct0}} fewer tokens, and +{{n:e3b_mean_minus_sft|pts1}} points over the supervised router it started from. Out of distribution the pattern repeats: {{n:ood_e3b_mean|pct1}} at {{n:ood_e3b_mean_tokens|f1}} tokens, against {{n:ood_e3b_mean_cot_acc|pct1}} at {{n:ood_e3b_mean_cot_tokens|f1}} for always reasoning.</p>
+
+<h3><span class="sec">10.3</span>The regret reward buys stability</h3>
+
+<figure class="wide">
+<div class="fig" id="fig-seeds"></div>
+<figcaption><b>Figure 11. Five seeds per reward.</b> Each dot is one complete RL run evaluated on the full split; bars are means.</figcaption>
+</figure>
+
+<p>This is the result I did not expect going in. With the regret reward, five seeds score {{n:test_e3b_mean|pct1}} ± {{n:test_e3b_sd|pts1}} points (range {{n:test_e3b_min|pct1}}–{{n:test_e3b_max|pct1}}). With an outcome-only reward, they score {{n:test_e2_mean|pct1}} ± {{n:test_e2_sd|pts1}} points (range {{n:test_e2_min|pct1}}–{{n:test_e2_max|pct1}}). The regret reward is {{n:test_seed_diff|pp1}} points better on average with {{n:test_seed_sd_ratio|f0}}× less spread between runs. With five runs on each side, a one-sided exact permutation test gives p = {{n:test_seed_p|p3}}. Out of distribution the direction is the same but the gap is small ({{n:ood_seed_diff|pp1}} points, p = {{n:ood_seed_p|p3}}), so I would not claim it there.</p>
+
+<p>The ablations tell a consistent story. Using the <em>measured</em> utilities for the regret instead of the probe's predictions gives the same result ({{n:e3bfix_test_acc|pct1}} against {{n:test_e3b_mean|pct1}}). The cheap probe is a valid stand-in for profiling every training question. The two extra rewards did not help. The false-equation penalty left the rate of reasoning traces with only true equations essentially unchanged ({{n:faithful_rate.e3|pct1}} with it, {{n:faithful_rate.e3b|pct1}} without), and adding it with the genre bonus <em>cost</em> {{n:paired_e3b_vs_e3.acc.0|pts1}} points ({{n:e3_test_acc|pct1}} against {{n:test_e3b_mean|pct1}}). On the same seed, the regret term alone beats outcome-only by {{n:paired_e3b_vs_e2.acc|ci_pp}}.</p>
+
+<p class="limit">Five seeds is enough to see that outcome-only runs vary a lot, not enough to say how often they fail badly. The stability claim is about this model, this data and 150 steps. Longer training might let outcome-only runs converge on their own.</p>
+
+<h3><span class="sec">10.4</span>What it learned to do</h3>
+
+<figure class="wide">
+<div class="fig" id="fig-genres"></div>
+<figcaption><b>Figure 12. When the model chooses to reason, by kind of question</b> (test, mean over five seeds). RL teaches the model to reason on multi-step scoring rules and arithmetic, and to keep making one-step decisions on comparisons, knowledge questions and most decisions. Switch to "accuracy" to see where it pays.</figcaption>
+</figure>
+
+<p>The behaviour RL found matches the meta-analysis from §2 {{cite:sprague2024cot}}, learned from scratch by a 4B model with no hint about which questions are "mathy". Scoring rules go from {{n:genre_rubric.sft_acc|pct0}} to {{n:genre_rubric.e3b_acc|pct0}} accuracy as the model learns to reason through rules of depth two and three. Arithmetic goes from {{n:genre_arith.sft_acc|pct0}} to {{n:genre_arith.e3b_acc|pct0}}. Comparisons stay at {{n:genre_compare.e3b_acc|pct0}} with almost no reasoning at all.</p>
+
+<figure class="wide">
+<div class="fig" id="fig-traces"></div>
+<figcaption><b>Figure 13. Real outputs from the trained model</b> (best seed, sealed test). Filter by kind of question, chosen mode and outcome; each card also shows the same question answered with reasoning forced on. Look for the hand-offs: a line or two of arithmetic, then <code>&lt;mode:jev&gt;</code> and a one-step pick. Questions from the BEV decision mix and OpenBookQA are left out here because their licences do not clearly allow republishing the text.</figcaption>
+</figure>
+
+<h2 id="worth"><span class="sec">§ 11</span>Is it worth it?</h2>
+
+<p>"Same accuracy, fewer tokens" only matters if tokens cost something, and how much they cost is a choice. The same saved outputs can be re-priced at any token price \(\lambda\) without retraining:</p>
+
+<figure class="wide">
+<div class="fig" id="fig-sweep"></div>
+<figcaption><b>Figure 14. Learned routing against always reasoning, as tokens get more expensive.</b> Utility difference between the model choosing its mode and the same weights always reasoning, averaged over the five regret-reward seeds, with a 95% bootstrap interval over questions. Above zero means routing wins.</figcaption>
+</figure>
+
+<p>At a token price of zero, where only accuracy counts, the two tie ({{n:sweep_at_0.diff|p3}}). At the price used in training, routing is ahead by {{n:sweep_at_train_lambda.diff|p3}} utility (95% interval {{n:sweep_at_train_lambda.lo|p3}} to {{n:sweep_at_train_lambda.hi|p3}}). At \(\lambda = 0.001\), where a hundred tokens are worth ten accuracy points, the gap is {{n:sweep_at_0001.diff|p3}}. Learned routing never loses.</p>
+
+<p>Tokens are not time, so I also timed {{n:latency.auto.n|int}} test questions one at a time on a single v5e chip, after a warm-up pass so that compilation does not count.</p>
+
+<figure>
+<div class="fig" id="fig-latency"></div>
+<figcaption><b>Figure 15. Wall-clock time per question at batch size 1.</b> The same trained weights on {{n:latency.auto.n|int}} test questions, once choosing their own mode and once forced to reason, on one v5e chip after a warm-up pass.</figcaption>
+</figure>
+
+<p>Learned routing answers in {{n:latency.auto.mean_s|f2}} seconds on average ({{n:latency.auto.median_s|f2}} median), against {{n:latency.cot.mean_s|f2}} ({{n:latency.cot.median_s|f2}} median) for always reasoning: {{n:latency_saving.mean|pct0}} faster on average and {{n:latency_saving.median|pct0}} at the median. That is less than the token saving, for a reason worth spelling out. A one-step decision should cost one forward pass, but in my runtime it took {{n:latency.auto.per_mode_mean_s.jev|f2}} seconds. The runtime decodes a short header before switching, re-reads the prompt at every switch instead of reusing the cache, and pays a fixed setup cost per generation call. A serving stack that stops at the mode tag and keeps the KV cache would turn most of the token saving into time.</p>
+
+<p>The whole project cost roughly forty dollars of spot TPU time. Data work, supervised training and evaluation ran on single v5e chips at about fifty cents an hour; RL needed a four-chip slice. The training step in Tunix returns a full second copy of the frozen 4B weights, which does not fit next to the first copy on a 16 GB chip.</p>
+
+<h2 id="discussion"><span class="sec">§ 12</span>Discussion and open questions</h2>
+
+<p>The thread through this project is that knowing when to think is not one decision but a chain of them. You have to measure what the model can do, teach it that it <em>can</em> switch, and reward it for switching well, not just for being right. The specific contributions, stated carefully against the work in §2:</p>
+<ul>
+<li><b>A fast path that generates nothing.</b> Learned think switches exist {{cite:fang2025thinkless,wu2025arm,kassenaar2026when}}, but their fast paths still write an answer. Here the fastest mode is a single forward pass reading the option letters, in the same network as the reasoning.</li>
+<li><b>Labels measured on the model.</b> The mode a question needs depends on the model; measuring it per question, with cross-fitting and stability checks, is what made learned routing match always-reasoning instead of trailing it.</li>
+<li><b>A regret reward against measured utilities</b>, which in these experiments turned an unstable RL procedure into a reproducible one.</li>
+</ul>
+
+<p>Questions I would most like to see answered, by me or anyone:</p>
+<ul>
+<li><b>Re-measure as you train.</b> Labels and regret come from the base model. Measure, train, re-measure, retrain: does the router keep improving as the model's own abilities change?</li>
+<li><b>Scale.</b> Does the stability benefit hold for 8B and larger models, and for longer RL runs?</li>
+<li><b>Beyond multiple choice.</b> The one-step mode needs a set of options. Typed decisions, such as a score on a scale, a tool call or an action, are the natural extension.</li>
+<li><b>Other modalities.</b> In an omni model, the modes become "answer from the image directly", "describe it, then reason" and "pick an option". The same recipe should apply: measure each mode, teach the switches, reward the regret. That is the next project.</li>
+</ul>
+
+<h2 id="references"><span class="sec">§</span>References</h2>
+<!--REFERENCES-->
+
+<h2 id="appendix"><span class="sec">§ A</span>Appendix: engineering notes</h2>
+
+<p><b>Reproducibility.</b> The code, configs and a Tunix notebook are in <a href="https://github.com/TinevimboMusingadi/kwtfs-public">kwtfs-public</a>. Data and labels are on Hugging Face, with question text omitted for sources whose licence does not allow redistribution. Every number on this page is regenerated from saved model outputs by the scripts in this site's repository.</p>
+
+<p><b>Training details.</b> Base model: Qwen3-4B in bfloat16, LoRA rank 16 on all attention and MLP projections. SFT: one epoch over {{n:sft_examples|int}} examples, batch 2, learning rate 1e-4, with the mode-tag tokens weighted 5× in the loss. GRPO: 150 steps, 4 prompts × 8 samples, learning rate 3e-5, KL weight 0.02, clip 0.2, sampling temperature 1.0, generation capped at 256 tokens, on a TPU v5litepod-4 slice.</p>
+
+<p><b>Small TPUs teach you things.</b> A dozen bugs were caught by tiny smoke runs before they could waste a full one. Tunix computes in float32 unless told otherwise, so the KV cache alone overflowed a 16 GB chip. The one-step decision built logits over the entire 152k vocabulary at every position. Compiled programs piled up in memory until the decoder could not load. My favourite: the reasoning prompt said "end with <code>&lt;answer&gt;FINAL&lt;/answer&gt;</code>", and the model dutifully wrote the word FINAL. Accuracy for that mode was zero until I gave it a real example.</p>
+
+<p><b>Citation.</b></p>
+<pre><code>@misc{musingadi2026kwtfs,
+  author = {Musingadi, Tinevimbo},
+  title  = {Knowing When to Think Fast or Slow at Test Time},
+  year   = {2026},
+  url    = {https://tinevimbomusingadi.github.io/kwtfs-blog/}
+}</code></pre>
