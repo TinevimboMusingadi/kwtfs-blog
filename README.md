@@ -34,9 +34,9 @@ committed `data/` is what the page uses. `research_notes/bibliography.md` holds 
 
 ## Data notes
 
-Example traces quote question text only from sources whose licences allow it (GSM8K, AQuA, ARC, CommonsenseQA and
-procedurally generated tasks). Questions from the BEV decision mix and OpenBookQA appear only as IDs and statistics. Quoted questions keep
-their source licences (ARC is CC BY-SA 4.0) and are not covered by the CC BY 4.0 licence below.
+Example traces quote question text only from sources whose licences allow it (GSM8K, AQuA-RAT, CommonsenseQA and
+procedurally generated tasks). Questions from the BEV decision mix, OpenBookQA and ARC appear only as IDs and
+statistics. Quoted questions keep their source licences and are not covered by the CC BY 4.0 licence below.
 
 ## Licence
 

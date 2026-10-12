@@ -24,7 +24,7 @@ import numpy as np
 OUT = pathlib.Path(__file__).resolve().parents[1] / "data"
 E2 = ["e2", "e2s1", "e2-s2", "e2-s3", "e2-s4"]
 E3B = ["e3b", "e3bs1", "e3b-s2", "e3b-s3", "e3b-s4"]
-NO_TEXT = ("bev-", "openbookqa-")  # sources released as IDs only (see DATASHEET)
+NO_TEXT = ("bev-", "openbookqa-", "arc-")  # sources released as IDs only (see DATASHEET)
 GENRES = ["compare", "knowledge", "decision", "rubric", "arith", "wordproblem"]
 LAM = 0.0005
 

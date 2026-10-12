@@ -234,7 +234,7 @@ The ablations tell a consistent story. Using the *measured* utilities for the re
 The behaviour RL found matches the meta-analysis from §2 [13], learned from scratch by a 4B model with no hint about which questions are "mathy". Scoring rules go from 55% to 100% accuracy as the model learns to reason through rules of depth two and three. Arithmetic goes from 83% to 94%. Comparisons stay at 100% with almost no reasoning at all.
 
 ![**Figure 13. Real outputs from the trained model** (best seed, sealed test). Filter by kind of question, chosen mode and](https://tinevimbomusingadi.github.io/kwtfs-blog/img/fig-traces.png)
-***Figure 13. Real outputs from the trained model** (best seed, sealed test). Filter by kind of question, chosen mode and outcome; each card also shows the same question answered with reasoning forced on. Look for the hand-offs: a line or two of arithmetic, then `<mode:jev>` and a one-step pick. Questions from the BEV decision mix and OpenBookQA are left out here because their licences do not clearly allow republishing the text.* [Interactive version](https://tinevimbomusingadi.github.io/kwtfs-blog/#fig-traces)
+***Figure 13. Real outputs from the trained model** (best seed, sealed test). Filter by kind of question, chosen mode and outcome; each card also shows the same question answered with reasoning forced on. Look for the hand-offs: a line or two of arithmetic, then `<mode:jev>` and a one-step pick. Questions from the BEV decision mix, OpenBookQA and ARC are left out here because their licences do not clearly allow republishing the text.* [Interactive version](https://tinevimbomusingadi.github.io/kwtfs-blog/#fig-traces)
 
 ## § 11 Is it worth it?
 
